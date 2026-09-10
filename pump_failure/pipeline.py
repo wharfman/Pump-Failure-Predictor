@@ -4,11 +4,14 @@ from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
 import random
+import sys
+from time import perf_counter
 
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from .data import Preprocessor, WindowDataset, read_data, split_data
 from .model import LSTMAutoencoder, reconstruction_error
@@ -102,11 +105,24 @@ def make_loader(dataset, config, shuffle=False):
                       pin_memory=select_device(config.device).type == "cuda")
 
 
-def run_epoch(model, loader, device, optimizer=None, gradient_clip=1.0):
+def progress_bar(iterable=None, *, total=None, description="", enabled=True,
+                 position=0, leave=True):
+    return tqdm(iterable, total=total, desc=description, unit="batch",
+                disable=not enabled or not sys.stderr.isatty(),
+                dynamic_ncols=True, ascii=True, mininterval=0.25, smoothing=0,
+                position=position, leave=leave,
+                bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
+                           "[elapsed {elapsed} | ETA {remaining}{postfix}]")
+
+
+def run_epoch(model, loader, device, optimizer=None, gradient_clip=1.0,
+              description="", overall=None, show_progress=False):
     model.train(optimizer is not None)
     total, count = 0.0, 0
-    with torch.set_grad_enabled(optimizer is not None):
-        for x in loader:
+    with torch.set_grad_enabled(optimizer is not None), progress_bar(
+            loader, description=description, enabled=show_progress,
+            position=1 if overall is not None else 0, leave=False) as batches:
+        for x in batches:
             x = x.to(device, non_blocking=True)
             if optimizer is not None:
                 optimizer.zero_grad(set_to_none=True)
@@ -120,16 +136,20 @@ def run_epoch(model, loader, device, optimizer=None, gradient_clip=1.0):
                 optimizer.step()
             total += loss.item() * len(x)
             count += len(x)
+            batches.set_postfix(mse=f"{total / count:.6f}", refresh=False)
+            if overall is not None:
+                overall.update(1)
     return total / count
 
 
 @torch.inference_mode()
-def score(model, loader, device):
+def score(model, loader, device, description="Scoring", show_progress=False):
     model.eval()
     errors = []
-    for x in loader:
-        x = x.to(device, non_blocking=True)
-        errors.append(reconstruction_error(x, model(x)).cpu().numpy())
+    with progress_bar(loader, description=description, enabled=show_progress) as batches:
+        for x in batches:
+            x = x.to(device, non_blocking=True)
+            errors.append(reconstruction_error(x, model(x)).cpu().numpy())
     if not errors:
         raise ValueError("No continuous windows available for scoring.")
     result = np.concatenate(errors)
@@ -159,7 +179,9 @@ def score_table(frame, dataset, errors, threshold=None):
     return result
 
 
-def train(config: Config, dry_run=False):
+def train(config: Config, dry_run=False, show_progress=True):
+    run_started = perf_counter()
+    print("Preparing sensor data and continuous windows...", flush=True)
     config.validate()
     random.seed(config.seed)
     np.random.seed(config.seed)
@@ -204,26 +226,50 @@ def train(config: Config, dry_run=False):
     save_json(output / "data_report.json", report)
     save_json(output / "preprocessing.json", processor.to_dict())
     history, best, stale = [], float("inf"), 0
-    for epoch in range(1, config.epochs + 1):
-        train_loss = run_epoch(model, loaders["train"], device, optimizer, config.gradient_clip)
-        val_loss = run_epoch(model, loaders["validation"], device)
-        history.append({"epoch": epoch, "train_mse": train_loss, "validation_mse": val_loss})
-        save_json(output / "history.json", history)
-        print(f"Epoch {epoch:03d}: train={train_loss:.6f} validation={val_loss:.6f}", flush=True)
-        if val_loss < best:
-            best, stale = val_loss, 0
-            torch.save({"format_version": 1, "model_state": model.state_dict(),
-                        "architecture": architecture, "config": asdict(config),
-                        "preprocessing": processor.to_dict(), "epoch": epoch,
-                        "validation_mse": best}, output / "best_model.pt")
-        else:
-            stale += 1
-            if stale >= config.patience:
-                print("Early stopping.", flush=True)
-                break
+    training_started = perf_counter()
+    print(f"Training for up to {config.epochs} epochs. ETA excludes final scoring; "
+          "early stopping may finish sooner.", flush=True)
+    with progress_bar(total=config.epochs * (len(loaders["train"]) + len(loaders["validation"])),
+                      description="Overall training", enabled=show_progress) as overall:
+        for epoch in range(1, config.epochs + 1):
+            epoch_started = perf_counter()
+            train_loss = run_epoch(
+                model, loaders["train"], device, optimizer, config.gradient_clip,
+                description=f"Epoch {epoch}/{config.epochs} train", overall=overall,
+                show_progress=show_progress)
+            val_loss = run_epoch(
+                model, loaders["validation"], device,
+                description=f"Epoch {epoch}/{config.epochs} validate", overall=overall,
+                show_progress=show_progress)
+            epoch_seconds = perf_counter() - epoch_started
+            history.append({"epoch": epoch, "train_mse": train_loss, "validation_mse": val_loss,
+                            "epoch_seconds": epoch_seconds,
+                            "elapsed_seconds": perf_counter() - training_started})
+            save_json(output / "history.json", history)
+            elapsed = perf_counter() - training_started
+            remaining = elapsed / epoch * (config.epochs - epoch)
+            tqdm.write(f"Epoch {epoch}/{config.epochs}: train={train_loss:.6f} "
+                       f"validation={val_loss:.6f} | epoch {tqdm.format_interval(epoch_seconds)} "
+                       f"| elapsed {tqdm.format_interval(elapsed)} "
+                       f"| ETA to max epochs {tqdm.format_interval(remaining)}")
+            if val_loss < best:
+                best, stale = val_loss, 0
+                torch.save({"format_version": 1, "model_state": model.state_dict(),
+                            "architecture": architecture, "config": asdict(config),
+                            "preprocessing": processor.to_dict(), "epoch": epoch,
+                            "validation_mse": best}, output / "best_model.pt")
+            else:
+                stale += 1
+                if stale >= config.patience:
+                    overall.set_description("Training stopped early")
+                    tqdm.write(f"Early stopping after {epoch} of {config.epochs} maximum epochs.")
+                    break
+    print(f"Training finished in {tqdm.format_interval(perf_counter() - training_started)}.",
+          flush=True)
     checkpoint = torch.load(output / "best_model.pt", map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state"])
-    errors = score(model, loaders["calibration"], device)
+    errors = score(model, loaders["calibration"], device,
+                   description="Calibration", show_progress=show_progress)
     threshold = float(np.quantile(errors, config.threshold_quantile))
     checkpoint["threshold"] = threshold
     torch.save(checkpoint, output / "best_model.pt")
@@ -232,7 +278,8 @@ def train(config: Config, dry_run=False):
                "normal_calibration_windows": len(errors)})
     score_table(splits["calibration"], datasets["calibration"], errors, threshold).to_csv(
         output / "calibration_scores.csv", index=False)
-    test_errors = score(model, loaders["test"], device)
+    test_errors = score(model, loaders["test"], device,
+                        description="Test scoring", show_progress=show_progress)
     table = score_table(splits["test"], datasets["test"], test_errors, threshold)
     table.to_csv(output / "test_scores.csv", index=False)
     truth = table["contains_abnormal_status"].to_numpy(dtype=bool)
@@ -247,7 +294,8 @@ def train(config: Config, dry_run=False):
                "normal_window_false_positive_rate": fp / (fp + tn) if fp + tn else None,
                "label_definition": "Any non-NORMAL row inside the window; not future failure."}
     save_json(output / "test_metrics.json", metrics)
-    print(f"Saved trained model, threshold, and test scores to {output}", flush=True)
+    print(f"Saved trained model, threshold, and test scores to {output}. "
+          f"Total elapsed: {tqdm.format_interval(perf_counter() - run_started)}.", flush=True)
     return metrics
 
 
@@ -286,6 +334,8 @@ def main():
     training.add_argument("--output", help="Override artifact directory")
     training.add_argument("--epochs", type=int)
     training.add_argument("--device", choices=["auto", "cpu", "cuda"])
+    training.add_argument("--no-progress", action="store_true",
+                          help="Hide live progress bars; keep epoch summaries")
     training.add_argument("--dry-run", action="store_true",
                           help="Validate full dataset and one training batch; save no model")
     prediction = commands.add_parser("predict", help="Score CSV with a calibrated checkpoint")
@@ -303,7 +353,7 @@ def main():
                                   ("epochs", "epochs"), ("device", "device")):
                 if getattr(args, option) is not None:
                     setattr(config, field, getattr(args, option))
-            train(config, dry_run=args.dry_run)
+            train(config, dry_run=args.dry_run, show_progress=not args.no_progress)
         else:
             predict(args.checkpoint, args.data, args.output, args.device,
                     args.stride, args.batch_size)
