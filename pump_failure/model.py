@@ -42,3 +42,9 @@ def reconstruction_error(original: torch.Tensor,
                          reconstructed: torch.Tensor) -> torch.Tensor:
     """One MSE per window, averaged across time and standardized sensors."""
     return (original - reconstructed).square().mean(dim=(1, 2))
+
+
+def reconstruction_loss(original: torch.Tensor, reconstructed: torch.Tensor,
+                        delta: float = 1.0) -> torch.Tensor:
+    """Mean Huber training/validation loss across batch, time, and sensors."""
+    return nn.functional.huber_loss(reconstructed, original, reduction="mean", delta=delta)

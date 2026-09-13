@@ -7,6 +7,16 @@ import torch
 from torch.utils.data import Dataset
 
 
+STATUS_LABELS = {"NORMAL": 0, "BROKEN": 1, "RECOVERING": 1}
+
+
+def binary_status_labels(status: pd.Series) -> np.ndarray:
+    normalized = status.astype("string").str.strip().str.upper()
+    if (~normalized.isin(STATUS_LABELS)).any():
+        raise ValueError("Status labels must be NORMAL, BROKEN, or RECOVERING.")
+    return normalized.map(STATUS_LABELS).to_numpy(dtype=np.int64)
+
+
 def read_data(path: str, require_status: bool = True) -> pd.DataFrame:
     frame = pd.read_csv(path)
     if "timestamp" not in frame:
@@ -29,18 +39,41 @@ def read_data(path: str, require_status: bool = True) -> pd.DataFrame:
             unknown = ~frame["machine_status"].isin(["NORMAL", "BROKEN", "RECOVERING"])
             if unknown.any():
                 raise ValueError("Training labels must be NORMAL, BROKEN, or RECOVERING.")
+        frame["binary_label"] = binary_status_labels(frame["machine_status"])
     return frame.reset_index(drop=True)
 
 
-def split_data(frame: pd.DataFrame, train: float, validation: float,
-               calibration: float) -> dict[str, pd.DataFrame]:
+def split_data(frame: pd.DataFrame, train: float = 0.6, validation: float = 0.2,
+               calibration: float = 0.0) -> dict[str, pd.DataFrame]:
+    """Split raw chronological rows; nonzero calibration supports legacy checkpoints."""
     fractions = np.array([train, validation, calibration], dtype=float)
-    if not np.isfinite(fractions).all() or (fractions <= 0).any() or fractions.sum() >= 1:
-        raise ValueError("Split fractions must be positive and sum to less than one.")
-    cuts = [0, *[int(len(frame) * f) for f in np.cumsum(fractions)], len(frame)]
-    names = ["train", "validation", "calibration", "test"]
+    if (not np.isfinite(fractions).all() or train <= 0 or validation <= 0
+            or calibration < 0 or fractions.sum() >= 1):
+        raise ValueError("Invalid split fractions; train and validation must be positive.")
+    names = ["train", "validation"]
+    cumulative = [train, train + validation]
+    if calibration > 0:
+        names.append("calibration")
+        cumulative.append(train + validation + calibration)
+    names.append("test")
+    cuts = [0, *[int(len(frame) * f) for f in cumulative], len(frame)]
     return {name: frame.iloc[a:b].reset_index(drop=True)
             for name, a, b in zip(names, cuts[:-1], cuts[1:])}
+
+
+def calibration_normal_mask(frame: pd.DataFrame, cooldown_hours: float = 0) -> np.ndarray:
+    """Exclude non-normal rows and a settling interval after the last such row.
+
+    Build on the full timeline before splitting so a preceding recovery is retained.
+    Uses only current/past labels. The settling duration is an operating assumption.
+    """
+    if not np.isfinite(cooldown_hours) or cooldown_hours < 0:
+        raise ValueError("Calibration cooldown hours must be finite and nonnegative.")
+    normal = frame["machine_status"].eq("NORMAL").fillna(False)
+    last_abnormal = frame["timestamp"].where(~normal).ffill()
+    settled = last_abnormal.isna() | (
+        frame["timestamp"] - last_abnormal > pd.Timedelta(hours=cooldown_hours))
+    return (normal & settled).to_numpy(dtype=bool)
 
 
 @dataclass
@@ -115,7 +148,9 @@ class WindowDataset(Dataset):
                 raise ValueError("Normal mask must match the data length.")
             bad = np.r_[0, np.cumsum(~np.asarray(normal_mask, dtype=bool))]
             valid &= (bad[ends] - bad[starts]) == 0
+        self.candidate_starts = starts
         self.starts = starts[valid]
+        self.ignored_starts = starts[~valid]
 
     def __len__(self) -> int:
         return len(self.starts)
